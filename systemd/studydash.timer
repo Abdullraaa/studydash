@@ -1,0 +1,12 @@
+[Unit]
+Description=Rebuild study dashboard stats every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+# Catch up on a rebuild missed while the laptop was asleep or powered off.
+Persistent=true
+Unit=studydash.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,7 @@
+[Unit]
+Description=Rebuild the study dashboard stats file
+Documentation=file:///home/ra/.local/bin/studydash
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/studydash collect

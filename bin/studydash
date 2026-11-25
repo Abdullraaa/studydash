@@ -1,0 +1,929 @@
+#!/usr/bin/env python3
+"""studydash - the only writer of ~/.local/state/studydash/stats.json.
+
+Every number the dashboard shows is decided here. The QML plugin reads
+stats.json and renders it; it computes nothing. So if a figure on screen
+looks wrong, this file is where the bug is.
+
+The .jsonl files are append-only on purpose: they are the record of what
+happened, and nothing in this program ever rewrites or deletes a line.
+Judgements about how to *read* that record - the four-hour session cap,
+the 28-day pace window - are applied here, at read time, so they can be
+changed later without having destroyed anything.
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import date, datetime, timedelta
+
+# ----------------------------------------------------------------- constants
+
+COURSE_NAME = "Cyber Security 101"
+TARGET_DATE = date(2026, 12, 15)
+TARGET_WEEKLY_HOURS = 5.0
+
+# A forgotten timer is the main way this data set goes bad. Anything longer
+# than this is counted as this, and said out loud rather than silently kept.
+SESSION_CAP_HOURS = 4.0
+
+# Pace is measured over the last four weeks only - an old burst should not
+# keep flattering a month of nothing.
+PACE_WINDOW_DAYS = 28
+
+# Past this, no amount of arithmetic earns anything but "behind".
+STALE_PROGRESS_DAYS = 10
+
+REVIEW_INTERVALS = [7, 30, 90]
+COLD_TOPIC_DAYS = 90
+
+# Where project work lives. Add a root here and the load card picks it up;
+# a root that does not exist yet is skipped, not an error.
+SCAN_ROOTS = [
+    os.path.expanduser("~/Work"),
+    os.path.expanduser("~/Projects"),
+]
+WORK_SCAN_DEPTH = 2
+
+STATE = os.path.expanduser("~/.local/state/studydash")
+PROGRESS = os.path.join(STATE, "progress.jsonl")
+SESSIONS = os.path.join(STATE, "sessions.jsonl")
+ROOMS = os.path.join(STATE, "rooms.jsonl")
+CURRENT = os.path.join(STATE, "session.current")
+STATS = os.path.join(STATE, "stats.json")
+
+# Reward sessions are tracked exactly like study sessions - an append-only log
+# plus a running marker - but kept in their own files so nothing here ever
+# touches stats.json. They are breaks, not study, and must not flatter a figure.
+REWARDS = os.path.join(STATE, "rewards.json")
+REWARD_CURRENT = os.path.join(STATE, "reward.current")
+REWARD_SESSION_WARN_MIN = 60
+REWARD_WEEKLY_WARN_MIN = 120
+REWARD_TIMER_UNIT = "studydash-reward-timer"
+
+
+# --------------------------------------------------------------------- io
+
+def warn(msg):
+    print("studydash: " + msg, file=sys.stderr)
+
+
+def read_jsonl(path):
+    """Read a record file, skipping (and reporting) any line that is not JSON.
+
+    One corrupt line must never take the whole dashboard down with it.
+    """
+    out = []
+    if not os.path.exists(path):
+        return out
+    with open(path, encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                warn("%s:%d is not valid JSON, skipped" % (os.path.basename(path), lineno))
+    return out
+
+
+def append_jsonl(path, obj):
+    os.makedirs(STATE, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(obj, sort_keys=True) + "\n")
+
+
+def write_json_atomic(path, obj):
+    """Write via a temp file and rename.
+
+    The shell watches this path; a partial write would be parsed as a
+    corrupt file and blank the dashboard.
+    """
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".stats-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def parse_date(value):
+    try:
+        return date.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_dt(value):
+    try:
+        return datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def now():
+    return datetime.now().astimezone()
+
+
+def today():
+    return date.today()
+
+
+def notify(title, body, glyph=None):
+    # Omarchy's notification daemon silences do-not-disturb by SENDER, not by
+    # urgency alone: Delivery.js bypassesQuiet() passes app == "omarchy-action"
+    # unconditionally, and app == "notify-send" only at CRITICAL urgency.
+    # A plain notify-send at normal urgency is dropped outright while DND is on
+    # (it is also classed ephemeral, so it leaves no history row to find later)
+    # -- which is why starting a session looked like a dead keybind.
+    # Prefer the Omarchy sender; fall back to notify-send at critical urgency.
+    if shutil.which("omarchy-notification-send"):
+        cmd = ["omarchy-notification-send"]
+        if glyph:
+            cmd += ["-g", glyph]
+        cmd += [title, body]
+        subprocess.run(cmd, check=False)
+    elif shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-u", "critical", title, body],
+                       check=False)
+
+
+def human_span(delta):
+    total = int(delta.total_seconds())
+    if total < 0:
+        total = 0
+    hours, rem = divmod(total, 3600)
+    minutes = rem // 60
+    if hours:
+        return "%dh %02dm" % (hours, minutes)
+    return "%dm" % minutes
+
+
+# ------------------------------------------------------------------- course
+
+def build_course(progress, ref):
+    entries = []
+    for row in progress:
+        d = parse_date(row.get("date"))
+        try:
+            pct = float(row.get("percent"))
+        except (TypeError, ValueError):
+            continue
+        if d is not None:
+            entries.append((d, pct))
+    entries.sort(key=lambda e: e[0])
+
+    days_remaining = (TARGET_DATE - ref).days
+    weeks_remaining = days_remaining / 7.0
+
+    out = {
+        "name": COURSE_NAME,
+        "percent": 0,
+        "target_date": TARGET_DATE.isoformat(),
+        "days_remaining": days_remaining,
+        "percent_per_week_required": None,
+        "percent_per_week_actual": None,
+        "status": "unknown",
+        "days_since_last_progress": None,
+    }
+
+    if not entries:
+        if weeks_remaining > 0:
+            out["percent_per_week_required"] = round(100.0 / weeks_remaining, 1)
+        return out
+
+    percent = entries[-1][1]
+    out["percent"] = int(percent) if float(percent).is_integer() else round(percent, 1)
+    out["days_since_last_progress"] = (ref - entries[-1][0]).days
+
+    required = None
+    if weeks_remaining > 0:
+        required = max(0.0, (100.0 - percent) / weeks_remaining)
+        out["percent_per_week_required"] = round(required, 1)
+
+    # Actual pace needs two points spanning at least a week. One point is not
+    # a rate, and rounding it into one would be the exact lie this dashboard
+    # exists to avoid.
+    window = [e for e in entries if (ref - e[0]).days <= PACE_WINDOW_DAYS]
+    actual = None
+    if len(window) >= 2:
+        span = (window[-1][0] - window[0][0]).days
+        if span >= 7:
+            actual = (window[-1][1] - window[0][1]) / (span / 7.0)
+            out["percent_per_week_actual"] = round(actual, 1)
+
+    if percent >= 100:
+        out["status"] = "ahead"
+    elif out["days_since_last_progress"] > STALE_PROGRESS_DAYS:
+        # The override. Whatever the maths says, ten days of nothing is behind.
+        out["status"] = "behind"
+    elif actual is None or required is None:
+        out["status"] = "unknown"
+    elif required <= 0:
+        out["status"] = "ahead"
+    elif actual > required * 1.1:
+        out["status"] = "ahead"
+    elif actual >= required * 0.9:
+        out["status"] = "on_track"
+    else:
+        out["status"] = "behind"
+
+    return out
+
+
+# -------------------------------------------------------------------- hours
+
+def build_hours(sessions, ref):
+    """Four Monday-started weeks ending with the current (partial) one.
+
+    The buckets and the headline total are the same numbers, so the bars on
+    screen always add up to the average printed above them.
+    """
+    this_monday = ref - timedelta(days=ref.weekday())
+    starts = [this_monday - timedelta(days=7 * i) for i in (3, 2, 1, 0)]
+    buckets = {s: 0.0 for s in starts}
+    window_start = starts[0]
+
+    truncated = []
+    cap = timedelta(hours=SESSION_CAP_HOURS)
+
+    for row in sessions:
+        start = parse_dt(row.get("start"))
+        end = parse_dt(row.get("end"))
+        if start is None or end is None:
+            continue
+        duration = end - start
+        if duration.total_seconds() <= 0:
+            warn("session ending %s is not after its start, skipped" % row.get("end"))
+            continue
+
+        counted = duration
+        if duration > cap:
+            counted = cap
+            truncated.append({
+                "start": row.get("start"),
+                "end": row.get("end"),
+                "real_hours": round(duration.total_seconds() / 3600.0, 1),
+                "counted_hours": SESSION_CAP_HOURS,
+            })
+
+        day = end.date()
+        if day < window_start or day > ref:
+            continue
+        bucket = day - timedelta(days=day.weekday())
+        if bucket in buckets:
+            buckets[bucket] += counted.total_seconds() / 3600.0
+
+    weeks = [{"week_start": s.isoformat(), "hours": round(buckets[s], 1)} for s in starts]
+    total = round(sum(buckets.values()), 1)
+    avg = round(total / 4.0, 1)
+
+    if avg > TARGET_WEEKLY_HOURS * 1.1:
+        status = "ahead"
+    elif avg >= TARGET_WEEKLY_HOURS * 0.9:
+        status = "on_track"
+    else:
+        status = "behind"
+
+    # Only sessions inside the shown window are worth flagging on screen.
+    shown_truncated = [t for t in truncated
+                       if parse_dt(t["end"]) and window_start <= parse_dt(t["end"]).date() <= ref]
+
+    return {
+        "rolling_4wk_total": total,
+        "rolling_4wk_weekly_avg": avg,
+        "target_weekly": TARGET_WEEKLY_HOURS,
+        "status": status,
+        "truncated_count": len(shown_truncated),
+        "weeks": weeks,
+    }, shown_truncated
+
+
+# ----------------------------------------------------------------- revision
+
+def fold_rooms(rows):
+    """Collapse the append-only room log into one record per room.
+
+    First `completed` seen wins; `reviews` is the union across every line for
+    that room, so appending a new line with an extra review date is all a
+    `studydash review` has to do.
+    """
+    folded = {}
+    for row in rows:
+        name = str(row.get("room") or "").strip()
+        if not name:
+            continue
+        completed = parse_date(row.get("completed"))
+        entry = folded.setdefault(name, {"completed": completed, "reviews": set()})
+        if entry["completed"] is None:
+            entry["completed"] = completed
+        for r in row.get("reviews") or []:
+            d = parse_date(r)
+            if d is not None:
+                entry["reviews"].add(d)
+    for name, entry in folded.items():
+        entry["reviews"] = sorted(entry["reviews"])
+    return folded
+
+
+def build_revision(rooms, ref):
+    folded = fold_rooms(rooms)
+    due = []
+    cold = []
+
+    for name, entry in folded.items():
+        completed = entry["completed"]
+        if completed is None:
+            continue
+        reviews = entry["reviews"]
+
+        # Report only the earliest outstanding interval per room. A room
+        # neglected for a year should be one line saying so, not three.
+        for i, interval in enumerate(REVIEW_INTERVALS):
+            if len(reviews) > i:
+                continue
+            due_at = completed + timedelta(days=interval)
+            if ref >= due_at:
+                due.append({
+                    "room": name,
+                    "interval": "%dd" % interval,
+                    "overdue_days": (ref - due_at).days,
+                })
+            break
+
+        last_touch = max([completed] + reviews)
+        if (ref - last_touch).days >= COLD_TOPIC_DAYS:
+            cold.append(name)
+
+    due.sort(key=lambda d: (-d["overdue_days"], d["room"]))
+    cold.sort()
+
+    return {"due": due, "due_count": len(due), "cold_topics": cold}
+
+
+# --------------------------------------------------------------------- load
+
+def tilde(path):
+    home = os.path.expanduser("~")
+    return "~" + path[len(home):] if path.startswith(home) else path
+
+
+def scan_roots():
+    """Walk every configured root and report what was actually seen.
+
+    Returns (groups, missing): groups is [(root, [repo, ...]), ...] in
+    SCAN_ROOTS order, missing is the roots that do not exist.
+
+    A missing root is not an error - you may simply not have cloned anything
+    there yet - but it must never be silent. A scan root with a typo in it
+    looks exactly like a scan root with no repos in it, which is how
+    `~/projects` sat here for a while quietly matching nothing.
+    """
+    groups = []
+    missing = []
+    seen = set()
+    for scan_root in SCAN_ROOTS:
+        if not os.path.isdir(scan_root):
+            missing.append(scan_root)
+            continue
+        repos = []
+        for root, dirs, _files in os.walk(scan_root):
+            depth = root[len(scan_root):].count(os.sep)
+            if os.path.isdir(os.path.join(root, ".git")):
+                # Resolve before deduping, so a symlink from one root into
+                # another cannot count the same repo twice.
+                real = os.path.realpath(root)
+                if real not in seen:
+                    seen.add(real)
+                    repos.append(root)
+                dirs[:] = []      # do not descend into a repo's submodules
+                continue
+            if depth >= WORK_SCAN_DEPTH:
+                dirs[:] = []
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d != "node_modules"]
+        repos.sort()
+        groups.append((scan_root, repos))
+    return groups, missing
+
+
+def find_repos():
+    groups, _missing = scan_roots()
+    return [repo for _root, repos in groups for repo in repos]
+
+
+def touched_repos(repos, since):
+    out = []
+    for repo in repos:
+        try:
+            result = subprocess.run(
+                ["git", "-C", repo, "log", "--since=" + since, "-1", "--format=%H"],
+                capture_output=True, text=True, timeout=10, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            out.append(repo)
+    return out
+
+
+def repos_touched(repos, since):
+    return len(touched_repos(repos, since))
+
+
+def build_load():
+    repos = find_repos()
+    return {
+        "repos_touched_7d": repos_touched(repos, "7 days ago"),
+        "repos_touched_28d": repos_touched(repos, "28 days ago"),
+    }
+
+
+# ------------------------------------------------------------------ collect
+
+def collect():
+    ref = today()
+    hours, truncated = build_hours(read_jsonl(SESSIONS), ref)
+    stats = {
+        "generated_at": now().replace(microsecond=0).isoformat(),
+        "course": build_course(read_jsonl(PROGRESS), ref),
+        "hours": hours,
+        "revision": build_revision(read_jsonl(ROOMS), ref),
+        "load": build_load(),
+    }
+    write_json_atomic(STATS, stats)
+    return stats, truncated
+
+
+# ----------------------------------------------------------------- sessions
+
+def read_current():
+    if not os.path.exists(CURRENT):
+        return None
+    with open(CURRENT, encoding="utf-8") as fh:
+        return parse_dt(fh.read().strip())
+
+
+def session_start():
+    running = read_current()
+    if running is not None:
+        # Never overwrite. Doing so would erase the start time and lose the
+        # entire session in silence.
+        print("session already running - started %s, %s elapsed"
+              % (running.strftime("%H:%M"), human_span(now() - running)))
+        print("stop it with: studydash session stop")
+        return 1
+    if os.path.exists(CURRENT):
+        warn("session.current exists but is unreadable; refusing to overwrite it")
+        return 1
+    os.makedirs(STATE, exist_ok=True)
+    started = now().replace(microsecond=0)
+    with open(CURRENT, "w", encoding="utf-8") as fh:
+        fh.write(started.isoformat() + "\n")
+    print("session started %s" % started.strftime("%H:%M"))
+    notify("Study session started", started.strftime("%H:%M"))
+    return 0
+
+
+def session_stop():
+    started = read_current()
+    if started is None:
+        if os.path.exists(CURRENT):
+            warn("session.current is unreadable; leaving it in place")
+            return 1
+        print("no session running")
+        return 1
+    ended = now().replace(microsecond=0)
+    # A zero-length session is a fat-fingered toggle, not study. Writing it
+    # would put a permanently unusable line in an append-only file, which
+    # then warns on every collect for the rest of time.
+    if (ended - started).total_seconds() <= 0:
+        os.unlink(CURRENT)
+        print("session discarded - no time elapsed")
+        return 0
+    append_jsonl(SESSIONS, {"start": started.isoformat(), "end": ended.isoformat()})
+    os.unlink(CURRENT)
+    span = human_span(ended - started)
+    print("session stopped - %s logged" % span)
+    if (ended - started).total_seconds() / 3600.0 > SESSION_CAP_HOURS:
+        print("note: longer than %gh, so it will count as %gh"
+              % (SESSION_CAP_HOURS, SESSION_CAP_HOURS))
+    notify("Study session stopped", span + " logged")
+    collect()
+    return 0
+
+
+def session_status():
+    started = read_current()
+    if started is None:
+        print("no session running")
+        return 1
+    print("running - started %s, %s elapsed"
+          % (started.strftime("%H:%M"), human_span(now() - started)))
+    return 0
+
+
+def cmd_session(args):
+    action = args[0] if args else "status"
+    if action == "start":
+        return session_start()
+    if action == "stop":
+        return session_stop()
+    if action == "status":
+        return session_status()
+    if action == "toggle":
+        return session_stop() if read_current() is not None else session_start()
+    warn("unknown session action: %s (start|stop|toggle|status)" % action)
+    return 2
+
+
+# ------------------------------------------------------------------ rewards
+
+def reward_week_minutes(sessions, ref):
+    """Total reward minutes inside the current (Monday-started) week.
+
+    Same week boundary as build_hours, so 'this week' means the same thing for
+    rewards as it does for study hours. Non-positive spans are ignored - a
+    zero-length reward is never logged, but an old hand-edited line might be.
+    """
+    this_monday = ref - timedelta(days=ref.weekday())
+    total = 0.0
+    for row in sessions:
+        start = parse_dt(row.get("start"))
+        end = parse_dt(row.get("end"))
+        if start is None or end is None:
+            continue
+        seconds = (end - start).total_seconds()
+        if seconds <= 0:
+            continue
+        day = end.date()
+        if day < this_monday or day > ref:
+            continue
+        total += seconds / 60.0
+    return total
+
+
+def read_reward_current():
+    """The running reward marker carries its topic, so stop can log it.
+
+    Returns {"start": datetime, "topic": str|None} or None if the marker is
+    absent or unreadable. Callers tell those two apart with os.path.exists, so
+    an unreadable marker is never silently overwritten.
+    """
+    if not os.path.exists(REWARD_CURRENT):
+        return None
+    try:
+        with open(REWARD_CURRENT, encoding="utf-8") as fh:
+            obj = json.loads(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+    start = parse_dt(obj.get("start")) if isinstance(obj, dict) else None
+    if start is None:
+        return None
+    return {"start": start, "topic": obj.get("topic")}
+
+
+def schedule_reward_timer():
+    """Arm a one-shot desktop nudge at the soft cap, so the warning lands even
+    if the timer is forgotten and stop is never run.
+
+    Best effort only: without systemd-run there is simply no live nudge, which
+    must never stop a reward session from being started and tracked.
+    """
+    if not shutil.which("systemd-run"):
+        warn("systemd-run not found; no live %d-min reward nudge scheduled"
+             % REWARD_SESSION_WARN_MIN)
+        return
+    body = "%d min is up - stop here." % REWARD_SESSION_WARN_MIN
+    try:
+        result = subprocess.run(
+            ["systemd-run", "--user",
+             "--on-active=%dmin" % REWARD_SESSION_WARN_MIN,
+             "--unit=" + REWARD_TIMER_UNIT,
+             "notify-send", "Reward session", body],
+            capture_output=True, text=True, check=False)
+    except OSError as exc:
+        warn("could not schedule reward nudge: %s" % exc)
+        return
+    if result.returncode != 0:
+        warn("could not schedule reward nudge: %s"
+             % (result.stderr.strip() or "systemd-run exited %d" % result.returncode))
+
+
+def cancel_reward_timer():
+    """Stop the soft-cap nudge. A unit that already fired or was never armed is
+    the normal case, not an error - it must never crash stop.
+
+    systemd-run --on-active creates a .timer (the pending trigger) and a
+    .service (the payload). It is the .timer that would still fire the nudge, so
+    both are named explicitly here - a bare name would stop only the .service
+    and leave the timer armed to notify after the session had already ended.
+    """
+    try:
+        subprocess.run(["systemctl", "--user", "stop",
+                        REWARD_TIMER_UNIT + ".timer", REWARD_TIMER_UNIT + ".service"],
+                       capture_output=True, text=True, check=False)
+    except OSError:
+        pass
+
+
+def reward_start(rest):
+    topic = None
+    i = 0
+    while i < len(rest):
+        if rest[i] == "--topic":
+            if i + 1 >= len(rest):
+                warn("--topic needs a name")
+                return 2
+            topic = rest[i + 1]
+            i += 2
+        else:
+            warn("unexpected argument: %s" % rest[i])
+            return 2
+
+    running = read_reward_current()
+    if running is not None:
+        print("reward session already running - started %s, %s elapsed"
+              % (running["start"].strftime("%H:%M"), human_span(now() - running["start"])))
+        print("stop it with: studydash reward stop")
+        return 1
+    if os.path.exists(REWARD_CURRENT):
+        warn("reward.current exists but is unreadable; refusing to overwrite it")
+        return 1
+
+    # Say it before starting: the point is to notice the week is already spent
+    # on rewards, not to be told after adding to it.
+    week = reward_week_minutes(read_jsonl(REWARDS), today())
+    if week > REWARD_WEEKLY_WARN_MIN:
+        print("note: %d min of rewards already this week (over %d)"
+              % (round(week), REWARD_WEEKLY_WARN_MIN))
+
+    os.makedirs(STATE, exist_ok=True)
+    started = now().replace(microsecond=0)
+    with open(REWARD_CURRENT, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"start": started.isoformat(), "topic": topic}, sort_keys=True) + "\n")
+    label = " (%s)" % topic if topic else ""
+    print("reward session started %s%s" % (started.strftime("%H:%M"), label))
+    notify("Reward session started", started.strftime("%H:%M") + label)
+    schedule_reward_timer()
+    return 0
+
+
+def reward_stop():
+    running = read_reward_current()
+    if running is None:
+        if os.path.exists(REWARD_CURRENT):
+            warn("reward.current is unreadable; leaving it in place")
+            return 1
+        print("no reward session running")
+        return 1
+    started, topic = running["start"], running["topic"]
+    ended = now().replace(microsecond=0)
+
+    # A zero-length reward is a fat-fingered toggle, not a break. Discard it -
+    # and cancel the nudge, so no unit is left ticking for a session that never
+    # really happened.
+    if (ended - started).total_seconds() <= 0:
+        cancel_reward_timer()
+        os.unlink(REWARD_CURRENT)
+        print("reward session discarded - no time elapsed")
+        return 0
+
+    cancel_reward_timer()
+    record = {"start": started.isoformat(), "end": ended.isoformat()}
+    if topic:
+        record["topic"] = topic
+    append_jsonl(REWARDS, record)
+    os.unlink(REWARD_CURRENT)
+    span = human_span(ended - started)
+    print("reward session stopped - %s logged" % span)
+
+    minutes = (ended - started).total_seconds() / 60.0
+    if minutes > REWARD_SESSION_WARN_MIN:
+        print("note: longer than %d min - a reward, not a second study block"
+              % REWARD_SESSION_WARN_MIN)
+    week = reward_week_minutes(read_jsonl(REWARDS), today())
+    if week > REWARD_WEEKLY_WARN_MIN:
+        print("note: %d min of rewards this week (over %d)"
+              % (round(week), REWARD_WEEKLY_WARN_MIN))
+    notify("Reward session stopped", span + " logged")
+    return 0
+
+
+def reward_status():
+    running = read_reward_current()
+    if running is None:
+        print("no reward session running")
+        return 1
+    label = " (%s)" % running["topic"] if running["topic"] else ""
+    print("running - started %s, %s elapsed%s"
+          % (running["start"].strftime("%H:%M"),
+             human_span(now() - running["start"]), label))
+    return 0
+
+
+def cmd_reward(args):
+    action = args[0] if args else "status"
+    rest = args[1:]
+    if action == "start":
+        return reward_start(rest)
+    if action == "stop":
+        return reward_stop()
+    if action == "status":
+        return reward_status()
+    if action == "toggle":
+        return reward_stop() if read_reward_current() is not None else reward_start(rest)
+    warn("unknown reward action: %s (start|stop|toggle|status)" % action)
+    return 2
+
+
+# --------------------------------------------------------------------- log
+
+def cmd_log(args):
+    if not args:
+        warn("usage: studydash log <percent> [--room NAME]...")
+        return 2
+    try:
+        percent = float(args[0])
+    except ValueError:
+        warn("percent must be a number, got: %s" % args[0])
+        return 2
+    if not 0 <= percent <= 100:
+        warn("percent must be between 0 and 100, got: %g" % percent)
+        return 2
+
+    rooms = []
+    rest = args[1:]
+    i = 0
+    while i < len(rest):
+        if rest[i] == "--room":
+            if i + 1 >= len(rest):
+                warn("--room needs a name")
+                return 2
+            rooms.append(rest[i + 1])
+            i += 2
+        else:
+            warn("unexpected argument: %s" % rest[i])
+            return 2
+
+    stamp = today().isoformat()
+    append_jsonl(PROGRESS, {"date": stamp, "percent": percent})
+    for room in rooms:
+        append_jsonl(ROOMS, {"room": room, "completed": stamp, "reviews": []})
+
+    print("logged %g%% on %s" % (percent, stamp))
+    for room in rooms:
+        print("  room completed: %s" % room)
+    collect()
+    return 0
+
+
+def cmd_review(args):
+    if not args:
+        warn("usage: studydash review <room>")
+        return 2
+    name = args[0]
+    folded = fold_rooms(read_jsonl(ROOMS))
+    if name not in folded:
+        warn("unknown room: %s" % name)
+        if folded:
+            warn("known rooms: %s" % ", ".join(sorted(folded)))
+        return 1
+
+    entry = folded[name]
+    reviews = [d.isoformat() for d in entry["reviews"]]
+    stamp = today().isoformat()
+    if stamp in reviews:
+        print("%s already reviewed today" % name)
+        return 0
+    reviews.append(stamp)
+    append_jsonl(ROOMS, {
+        "room": name,
+        "completed": entry["completed"].isoformat() if entry["completed"] else stamp,
+        "reviews": reviews,
+    })
+    print("reviewed %s (%d total)" % (name, len(reviews)))
+    collect()
+    return 0
+
+
+# ------------------------------------------------------------------ status
+
+def fmt(value, suffix=""):
+    return "-" if value is None else "%s%s" % (value, suffix)
+
+
+def cmd_status(_args):
+    stats, truncated = collect()
+    c, h, r, l = stats["course"], stats["hours"], stats["revision"], stats["load"]
+
+    print("course  %s%%  ·  %d days left  ·  %s"
+          % (c["percent"], c["days_remaining"], c["status"]))
+    print("        %s needed vs %s actual"
+          % (fmt(c["percent_per_week_required"], "%/wk"),
+             fmt(c["percent_per_week_actual"], "%/wk")))
+    if c["days_since_last_progress"] is None:
+        print("        no progress logged yet")
+    else:
+        print("        last progress %d days ago" % c["days_since_last_progress"])
+
+    print("")
+    print("hours   %.1fh/wk avg vs %.1fh target — %s"
+          % (h["rolling_4wk_weekly_avg"], h["target_weekly"], h["status"]))
+    print("        " + "  ".join("%s %.1fh" % (w["week_start"][5:], w["hours"])
+                                 for w in h["weeks"]))
+    if truncated:
+        print("        ! %d session%s truncated to %gh:"
+              % (len(truncated), "" if len(truncated) == 1 else "s", SESSION_CAP_HOURS))
+        for t in truncated:
+            start, end = parse_dt(t["start"]), parse_dt(t["end"])
+            print("            %s %s → %s  (%.1fh, counted as %.1fh)"
+                  % (start.strftime("%Y-%m-%d"), start.strftime("%H:%M"),
+                     end.strftime("%H:%M"), t["real_hours"], t["counted_hours"]))
+
+    print("")
+    if r["due_count"] == 0:
+        print("review  nothing due")
+    else:
+        print("review  %d due" % r["due_count"])
+        for item in r["due"]:
+            when = ("%dd overdue" % item["overdue_days"]) if item["overdue_days"] else "due today"
+            print("        %-36s %-4s %s" % (item["room"], item["interval"], when))
+    if r["cold_topics"]:
+        print("        cold %dd+: %s" % (COLD_TOPIC_DAYS, ", ".join(r["cold_topics"])))
+
+    print("")
+    print("load    %d repos touched in 7d  ·  %d in 28d"
+          % (l["repos_touched_7d"], l["repos_touched_28d"]))
+
+    # Show the scan itself, so the number above can be checked against reality
+    # rather than trusted. Missing roots come first: they are the actionable
+    # thing, and a root that is silently wrong reads exactly like a root that
+    # is merely empty.
+    groups, missing = scan_roots()
+    for root in missing:
+        print("        ! scan root does not exist: %s" % tilde(root))
+    for root, repos in groups:
+        if not repos:
+            print("        %s — no repos" % tilde(root))
+            continue
+        print("        %s   %d repos" % (tilde(root), len(repos)))
+        recent = set(touched_repos(repos, "7 days ago"))
+        for repo in repos:
+            mark = " · touched 7d" if repo in recent else ""
+            print(("            %-34s%s" % (os.path.relpath(repo, root), mark)).rstrip())
+
+    running = read_current()
+    if running is not None:
+        print("")
+        print("session running - started %s, %s elapsed"
+              % (running.strftime("%H:%M"), human_span(now() - running)))
+    return 0
+
+
+# --------------------------------------------------------------------- main
+
+USAGE = """usage: studydash <command>
+
+  log <percent> [--room NAME]...  record course progress, and rooms finished
+  review <room>                   clear one review - after redoing the work
+  session start|stop|toggle|status
+  reward start|stop|toggle|status  [--topic NAME]   log a reward break
+  collect                         rebuild stats.json
+  status                          print everything the dashboard shows
+"""
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE, end="")
+        return 0
+    cmd, args = argv[0], argv[1:]
+    if cmd == "log":
+        return cmd_log(args)
+    if cmd == "review":
+        return cmd_review(args)
+    if cmd == "session":
+        return cmd_session(args)
+    if cmd == "reward":
+        return cmd_reward(args)
+    if cmd == "collect":
+        collect()
+        print("wrote %s" % STATS)
+        return 0
+    if cmd == "status":
+        return cmd_status(args)
+    warn("unknown command: %s" % cmd)
+    print(USAGE, end="", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

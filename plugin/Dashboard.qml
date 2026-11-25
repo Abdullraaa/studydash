@@ -69,7 +69,25 @@ Item {
   // take the keyboard away from whatever you were typing into.
   function open(payloadJson) {
     root.opened = true
+    root.nowMs = Date.now()
     statsFile.reload()
+  }
+
+  // Wall clock, refreshed only while the panel is up. Used for one thing:
+  // telling whether the collector has stopped writing. Every figure still
+  // comes from stats.json.
+  property real nowMs: Date.now()
+  readonly property bool isStale: {
+    if (!root.stats || !root.stats.stale_after) return false
+    var t = Date.parse(root.stats.stale_after)
+    return isFinite(t) && root.nowMs > t
+  }
+
+  Timer {
+    interval: 60000
+    repeat: true
+    running: root.opened
+    onTriggered: root.nowMs = Date.now()
   }
 
   function close() {
@@ -115,7 +133,7 @@ Item {
     WlrLayershell.layer: WlrLayer.Overlay
     // OnDemand, never Exclusive: the panel takes the keyboard only once you
     // click it, so opening it mid-sentence does not swallow your typing.
-    // SUPER+ALT+D closes it either way, so there is no stuck state.
+    // SUPER+D closes it either way, so there is no stuck state.
     WlrLayershell.keyboardFocus: root.opened ? WlrKeyboardFocus.OnDemand
                                              : WlrKeyboardFocus.None
     exclusionMode: ExclusionMode.Ignore
@@ -248,7 +266,11 @@ Item {
 
             Text {
               textFormat: Text.PlainText
-              text: root.courseData ? String(root.courseData.days_remaining) + " days left" : ""
+              text: {
+                if (!root.courseData) return ""
+                var n = Number(root.courseData.days_remaining)
+                return n >= 0 ? n + " days left" : (-n) + " days past target"
+              }
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.display
@@ -435,11 +457,14 @@ Item {
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             textFormat: Text.PlainText
-            color: Util.alpha(Color.muted, 0.6)
+            // Old numbers must not pass for current ones: if the collector
+            // has stopped, this line says so in the warning colour.
+            color: root.isStale ? Color.urgent : Util.alpha(Color.muted, 0.6)
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             text: root.stats
-                  ? "updated " + String(root.stats.generated_at || "").slice(0, 16).replace("T", " ")
+                  ? (root.isStale ? "STALE - " : "") + "updated "
+                    + String(root.stats.generated_at || "").slice(0, 16).replace("T", " ")
                   : ""
           }
         }

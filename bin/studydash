@@ -30,6 +30,17 @@ TARGET_WEEKLY_HOURS = 5.0
 # than this is counted as this, and said out loud rather than silently kept.
 SESSION_CAP_HOURS = 4.0
 
+# The other way: a double-tapped toggle. Anything shorter than this is not
+# study. Applied at read time (old lines stay), and refused at stop time.
+SESSION_MIN_SECONDS = 60
+
+# The overlay flags its numbers as stale past this. The timer runs every 15
+# minutes, so three missed runs means it has stopped.
+STALE_STATS_MINUTES = 45
+
+STUDY_TIMER_UNIT = "studydash-session-timer"
+STUDY_NUDGE_MIN = 180
+
 # Pace is measured over the last four weeks only - an old burst should not
 # keep flattering a month of nothing.
 PACE_WINDOW_DAYS = 28
@@ -146,15 +157,73 @@ def notify(title, body, glyph=None):
     # (it is also classed ephemeral, so it leaves no history row to find later)
     # -- which is why starting a session looked like a dead keybind.
     # Prefer the Omarchy sender; fall back to notify-send at critical urgency.
-    if shutil.which("omarchy-notification-send"):
-        cmd = ["omarchy-notification-send"]
+    cmd = notify_argv(title, body, glyph)
+    if cmd:
+        subprocess.run(cmd, check=False)
+
+
+def notify_argv(title, body, glyph=None):
+    """The command that delivers a notification through DND, or None.
+
+    Shared by notify() and the systemd-run nudges, so a deferred nudge goes
+    out through the same DND-proof sender as an immediate one. Absolute
+    paths, because a transient unit does not get this shell's PATH.
+    """
+    sender = shutil.which("omarchy-notification-send")
+    if sender:
+        cmd = [sender]
         if glyph:
             cmd += ["-g", glyph]
-        cmd += [title, body]
-        subprocess.run(cmd, check=False)
-    elif shutil.which("notify-send"):
-        subprocess.run(["notify-send", "-u", "critical", title, body],
-                       check=False)
+        return cmd + [title, body]
+    sender = shutil.which("notify-send")
+    if sender:
+        return [sender, "-u", "critical", title, body]
+    return None
+
+
+def schedule_nudge(unit, minutes, title, body):
+    """Arm a one-shot desktop nudge `minutes` from now, as a transient unit.
+
+    Best effort only: without systemd-run there is simply no live nudge, which
+    must never stop a session from being started and tracked.
+    """
+    cmd = notify_argv(title, body)
+    if not shutil.which("systemd-run") or cmd is None:
+        warn("systemd-run or a notifier is missing; no %d-min nudge scheduled" % minutes)
+        return
+    # A unit of this name left over (fired-and-failed, or a session whose
+    # marker was removed by hand) would make systemd-run refuse the name.
+    cancel_nudge(unit)
+    try:
+        result = subprocess.run(
+            ["systemd-run", "--user", "--collect",
+             "--on-active=%dmin" % minutes,
+             "--unit=" + unit] + cmd,
+            capture_output=True, text=True, check=False)
+    except OSError as exc:
+        warn("could not schedule nudge: %s" % exc)
+        return
+    if result.returncode != 0:
+        warn("could not schedule nudge: %s"
+             % (result.stderr.strip() or "systemd-run exited %d" % result.returncode))
+
+
+def cancel_nudge(unit):
+    """Stop a nudge. One that already fired or was never armed is the normal
+    case, not an error - it must never crash stop.
+
+    systemd-run --on-active creates a .timer (the pending trigger) and a
+    .service (the payload). It is the .timer that would still fire the nudge, so
+    both are named explicitly here - a bare name would stop only the .service
+    and leave the timer armed to notify after the session had already ended.
+    """
+    try:
+        subprocess.run(["systemctl", "--user", "stop", unit + ".timer", unit + ".service"],
+                       capture_output=True, text=True, check=False)
+        subprocess.run(["systemctl", "--user", "reset-failed", unit + ".timer", unit + ".service"],
+                       capture_output=True, text=True, check=False)
+    except OSError:
+        pass
 
 
 def human_span(delta):
@@ -214,6 +283,12 @@ def build_course(progress, ref):
     # a rate, and rounding it into one would be the exact lie this dashboard
     # exists to avoid.
     window = [e for e in entries if (ref - e[0]).days <= PACE_WINDOW_DAYS]
+    # Anchor the window on where you stood when it opened - the last point
+    # before it - not on its first point inside. Otherwise a gap right after
+    # the window opens is silently dropped from the denominator.
+    before = [e for e in entries if (ref - e[0]).days > PACE_WINDOW_DAYS]
+    if before and window:
+        window.insert(0, (ref - timedelta(days=PACE_WINDOW_DAYS), before[-1][1]))
     actual = None
     if len(window) >= 2:
         span = (window[-1][0] - window[0][0]).days
@@ -223,6 +298,10 @@ def build_course(progress, ref):
 
     if percent >= 100:
         out["status"] = "ahead"
+    elif days_remaining <= 0:
+        # The target has come and gone short of 100%. There is no required
+        # pace left to compare against, but that is a miss, not an unknown.
+        out["status"] = "behind"
     elif out["days_since_last_progress"] > STALE_PROGRESS_DAYS:
         # The override. Whatever the maths says, ten days of nothing is behind.
         out["status"] = "behind"
@@ -264,6 +343,8 @@ def build_hours(sessions, ref):
         duration = end - start
         if duration.total_seconds() <= 0:
             warn("session ending %s is not after its start, skipped" % row.get("end"))
+            continue
+        if duration.total_seconds() < SESSION_MIN_SECONDS:
             continue
 
         counted = duration
@@ -451,8 +532,12 @@ def build_load():
 def collect():
     ref = today()
     hours, truncated = build_hours(read_jsonl(SESSIONS), ref)
+    generated = now().replace(microsecond=0)
     stats = {
-        "generated_at": now().replace(microsecond=0).isoformat(),
+        "generated_at": generated.isoformat(),
+        # The overlay compares this to the clock. It is the one judgement it
+        # cannot get from here: whether here has stopped running.
+        "stale_after": (generated + timedelta(minutes=STALE_STATS_MINUTES)).isoformat(),
         "course": build_course(read_jsonl(PROGRESS), ref),
         "hours": hours,
         "revision": build_revision(read_jsonl(ROOMS), ref),
@@ -467,11 +552,27 @@ def collect():
 def read_current():
     if not os.path.exists(CURRENT):
         return None
-    with open(CURRENT, encoding="utf-8") as fh:
-        return parse_dt(fh.read().strip())
+    try:
+        with open(CURRENT, encoding="utf-8") as fh:
+            return parse_dt(fh.read().strip())
+    except OSError:
+        return None
+
+
+def refuse(title, body):
+    """Say no where it will be seen. These commands are mostly run from a
+    keybind, where stdout goes nowhere."""
+    print(body)
+    notify(title, body)
+    return 1
 
 
 def session_start():
+    if read_reward_current() is not None:
+        # One clock at a time: an hour that is both study and reward would
+        # flatter the study figure with time that was a break.
+        return refuse("Study session not started",
+                      "a reward session is running - stop it first")
     running = read_current()
     if running is not None:
         # Never overwrite. Doing so would erase the start time and lose the
@@ -489,6 +590,11 @@ def session_start():
         fh.write(started.isoformat() + "\n")
     print("session started %s" % started.strftime("%H:%M"))
     notify("Study session started", started.strftime("%H:%M"))
+    # A forgotten timer is how one session became 43 hours. Ask before the
+    # cap starts throwing time away.
+    schedule_nudge(STUDY_TIMER_UNIT, STUDY_NUDGE_MIN, "Study session",
+                   "running for %dh - still studying? SUPER+R stops it."
+                   % (STUDY_NUDGE_MIN // 60))
     return 0
 
 
@@ -501,12 +607,13 @@ def session_stop():
         print("no session running")
         return 1
     ended = now().replace(microsecond=0)
-    # A zero-length session is a fat-fingered toggle, not study. Writing it
-    # would put a permanently unusable line in an append-only file, which
-    # then warns on every collect for the rest of time.
-    if (ended - started).total_seconds() <= 0:
+    cancel_nudge(STUDY_TIMER_UNIT)
+    # A sub-minute session is a fat-fingered toggle, not study. Writing it
+    # would put a permanently useless line in an append-only file.
+    if (ended - started).total_seconds() < SESSION_MIN_SECONDS:
         os.unlink(CURRENT)
-        print("session discarded - no time elapsed")
+        print("session discarded - under %ds" % SESSION_MIN_SECONDS)
+        notify("Study session discarded", "under %ds - not logged" % SESSION_MIN_SECONDS)
         return 0
     append_jsonl(SESSIONS, {"start": started.isoformat(), "end": ended.isoformat()})
     os.unlink(CURRENT)
@@ -591,47 +698,14 @@ def read_reward_current():
 
 
 def schedule_reward_timer():
-    """Arm a one-shot desktop nudge at the soft cap, so the warning lands even
-    if the timer is forgotten and stop is never run.
-
-    Best effort only: without systemd-run there is simply no live nudge, which
-    must never stop a reward session from being started and tracked.
-    """
-    if not shutil.which("systemd-run"):
-        warn("systemd-run not found; no live %d-min reward nudge scheduled"
-             % REWARD_SESSION_WARN_MIN)
-        return
-    body = "%d min is up - stop here." % REWARD_SESSION_WARN_MIN
-    try:
-        result = subprocess.run(
-            ["systemd-run", "--user",
-             "--on-active=%dmin" % REWARD_SESSION_WARN_MIN,
-             "--unit=" + REWARD_TIMER_UNIT,
-             "notify-send", "Reward session", body],
-            capture_output=True, text=True, check=False)
-    except OSError as exc:
-        warn("could not schedule reward nudge: %s" % exc)
-        return
-    if result.returncode != 0:
-        warn("could not schedule reward nudge: %s"
-             % (result.stderr.strip() or "systemd-run exited %d" % result.returncode))
+    # The soft cap, as a live nudge, so the warning lands even if the timer
+    # is forgotten and stop is never run.
+    schedule_nudge(REWARD_TIMER_UNIT, REWARD_SESSION_WARN_MIN, "Reward session",
+                   "%d min is up - stop here." % REWARD_SESSION_WARN_MIN)
 
 
 def cancel_reward_timer():
-    """Stop the soft-cap nudge. A unit that already fired or was never armed is
-    the normal case, not an error - it must never crash stop.
-
-    systemd-run --on-active creates a .timer (the pending trigger) and a
-    .service (the payload). It is the .timer that would still fire the nudge, so
-    both are named explicitly here - a bare name would stop only the .service
-    and leave the timer armed to notify after the session had already ended.
-    """
-    try:
-        subprocess.run(["systemctl", "--user", "stop",
-                        REWARD_TIMER_UNIT + ".timer", REWARD_TIMER_UNIT + ".service"],
-                       capture_output=True, text=True, check=False)
-    except OSError:
-        pass
+    cancel_nudge(REWARD_TIMER_UNIT)
 
 
 def reward_start(rest):
@@ -647,6 +721,10 @@ def reward_start(rest):
         else:
             warn("unexpected argument: %s" % rest[i])
             return 2
+
+    if read_current() is not None:
+        return refuse("Reward session not started",
+                      "a study session is running - stop it first")
 
     running = read_reward_current()
     if running is not None:
@@ -785,16 +863,35 @@ def cmd_log(args):
     return 0
 
 
+def resolve_room(query, folded):
+    """Exact name first, then a case-insensitive unique prefix.
+
+    Room names carry colons and parentheses ("Wireshark: The Basics"), so
+    typing them exactly is the friction that keeps reviews from being logged.
+    A prefix that matches more than one room is refused, never guessed.
+    """
+    if query in folded:
+        return query
+    q = query.strip().lower()
+    hits = sorted(n for n in folded if n.lower().startswith(q)) if q else []
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        warn("'%s' matches %d rooms: %s" % (query, len(hits), ", ".join(hits)))
+    else:
+        warn("unknown room: %s" % query)
+        if folded:
+            warn("known rooms: %s" % ", ".join(sorted(folded)))
+    return None
+
+
 def cmd_review(args):
     if not args:
         warn("usage: studydash review <room>")
         return 2
-    name = args[0]
     folded = fold_rooms(read_jsonl(ROOMS))
-    if name not in folded:
-        warn("unknown room: %s" % name)
-        if folded:
-            warn("known rooms: %s" % ", ".join(sorted(folded)))
+    name = resolve_room(" ".join(args), folded)
+    if name is None:
         return 1
 
     entry = folded[name]
@@ -824,8 +921,11 @@ def cmd_status(_args):
     stats, truncated = collect()
     c, h, r, l = stats["course"], stats["hours"], stats["revision"], stats["load"]
 
-    print("course  %s%%  ·  %d days left  ·  %s"
-          % (c["percent"], c["days_remaining"], c["status"]))
+    left = c["days_remaining"]
+    print("course  %s%%  ·  %s  ·  %s"
+          % (c["percent"],
+             ("%d days left" % left) if left >= 0 else ("%d days past target" % -left),
+             c["status"]))
     print("        %s needed vs %s actual"
           % (fmt(c["percent_per_week_required"], "%/wk"),
              fmt(c["percent_per_week_actual"], "%/wk")))
@@ -894,6 +994,7 @@ USAGE = """usage: studydash <command>
 
   log <percent> [--room NAME]...  record course progress, and rooms finished
   review <room>                   clear one review - after redoing the work
+                                  (any unique, case-insensitive prefix)
   session start|stop|toggle|status
   reward start|stop|toggle|status  [--topic NAME]   log a reward break
   collect                         rebuild stats.json

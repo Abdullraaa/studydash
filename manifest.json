@@ -4,7 +4,7 @@
   "name": "Study Dashboard",
   "version": "1.1.0",
   "author": "Abdullraaa",
-  "license": "MIT",
+  "license": "PolyForm-Noncommercial-1.0.0",
   "description": "Are you on pace to finish your course by its deadline? A full-screen overlay of course pace, study hours and due reviews, plus a badge while a study session runs. Pairs with the bundled studydash CLI; run `bin/studydash setup` after adding.",
   "kinds": ["overlay"],
   "keepLoaded": true,

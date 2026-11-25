@@ -152,4 +152,10 @@ qmllint -I /usr/share/omarchy/shell -I /usr/lib/qt6/qml *.qml
 
 ## License
 
-MIT
+[PolyForm Noncommercial 1.0.0](LICENSE). You're free to use, change and
+share studydash for any non-commercial purpose, including personal study,
+schools, universities and charities. Selling it, or using it commercially,
+needs the author's permission. Open an issue to ask.
+
+Versions published before this change (up to commit `1dba7b5`) were released
+under the MIT licence.

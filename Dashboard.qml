@@ -5,7 +5,7 @@ import Quickshell.Wayland
 import qs.Commons
 
 // Study dashboard. It answers exactly one question:
-// am I on pace to finish Cyber Security 101 by 15 Dec 2026?
+// am I on pace to finish my course by its deadline?
 //
 // This file reads one file and renders it. It does not fetch, does not
 // shell out, and does not compute anything it displays — every number and
@@ -33,7 +33,22 @@ Item {
   readonly property var hoursData: (stats && stats.hours) ? stats.hours : null
   readonly property var revisionData: (stats && stats.revision) ? stats.revision : null
   readonly property var loadData: (stats && stats.load) ? stats.load : null
-  readonly property bool hasData: courseData !== null
+  // An unconfigured install still has a course block (all zeros); showing
+  // it would read as "0% and on track". Older stats files lack the key, and
+  // were always configured, hence the !== false.
+  readonly property bool configured: !!stats && stats.configured !== false
+  readonly property bool hasData: configured && courseData !== null
+
+  // The CLI that ships inside this plugin folder. Used only by the badge's
+  // stop click, so it works even before `studydash setup` has run.
+  readonly property string cliPath:
+    decodeURIComponent(Qt.resolvedUrl("bin/studydash").toString().replace(/^file:\/\//, ""))
+
+  SessionBadge {
+    cliPath: root.cliPath
+    warnAfterMinutes: (root.stats && root.stats.sessions && root.stats.sessions.nudge_minutes)
+                      ? Number(root.stats.sessions.nudge_minutes) : 180
+  }
 
   // Shares the [menu] surface tokens, so a theme that styles the menu
   // styles this too. Every colour is a live binding on the Color singleton:
@@ -207,7 +222,7 @@ Item {
 
         Text {
           textFormat: Text.PlainText
-          text: "no data"
+          text: root.stats ? "not set up" : "no data"
           color: Color.muted
           font.family: root.fontFamily
           font.pixelSize: Style.font.displayLarge
@@ -216,7 +231,7 @@ Item {
 
         Text {
           textFormat: Text.PlainText
-          text: "run: studydash collect"
+          text: root.stats ? "run: studydash setup" : "run: studydash collect"
           color: Color.muted
           font.family: root.fontFamily
           font.pixelSize: Style.font.title

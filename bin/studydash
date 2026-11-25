@@ -20,10 +20,15 @@ import sys
 import tempfile
 from datetime import date, datetime, timedelta
 
-# ----------------------------------------------------------------- constants
+# ----------------------------------------------------------------- settings
+#
+# Everything here is a default. ~/.config/studydash/config.toml overrides it
+# (see load_config / apply_config, and `studydash setup` to write one). The
+# course itself has no default: without a target date there is nothing to be
+# on pace for, and the dashboard says "not set up" rather than guess.
 
-COURSE_NAME = "Cyber Security 101"
-TARGET_DATE = date(2026, 12, 15)
+COURSE_NAME = ""
+TARGET_DATE = None
 TARGET_WEEKLY_HOURS = 5.0
 
 # A forgotten timer is the main way this data set goes bad. Anything longer
@@ -34,12 +39,13 @@ SESSION_CAP_HOURS = 4.0
 # study. Applied at read time (old lines stay), and refused at stop time.
 SESSION_MIN_SECONDS = 60
 
+# A running study session gets a "still studying?" nudge after this long.
+STUDY_NUDGE_MIN = 180
+STUDY_TIMER_UNIT = "studydash-session-timer"
+
 # The overlay flags its numbers as stale past this. The timer runs every 15
 # minutes, so three missed runs means it has stopped.
 STALE_STATS_MINUTES = 45
-
-STUDY_TIMER_UNIT = "studydash-session-timer"
-STUDY_NUDGE_MIN = 180
 
 # Pace is measured over the last four weeks only - an old burst should not
 # keep flattering a month of nothing.
@@ -51,13 +57,12 @@ STALE_PROGRESS_DAYS = 10
 REVIEW_INTERVALS = [7, 30, 90]  # each measured from the previous touch
 COLD_TOPIC_DAYS = 90
 
-# Where project work lives. Add a root here and the load card picks it up;
-# a root that does not exist yet is skipped, not an error.
-SCAN_ROOTS = [
-    os.path.expanduser("~/Work"),
-    os.path.expanduser("~/Projects"),
-]
+# Where project work lives, for the optional load card. Empty means the card
+# is off. A root that does not exist yet is reported, not an error.
+SCAN_ROOTS = []
 WORK_SCAN_DEPTH = 2
+
+CONFIG = os.path.join(os.path.expanduser("~/.config/studydash"), "config.toml")
 
 STATE = os.path.expanduser("~/.local/state/studydash")
 PROGRESS = os.path.join(STATE, "progress.jsonl")
@@ -69,11 +74,98 @@ STATS = os.path.join(STATE, "stats.json")
 # Reward sessions are tracked exactly like study sessions - an append-only log
 # plus a running marker - but kept in their own files so nothing here ever
 # touches stats.json. They are breaks, not study, and must not flatter a figure.
+# (The file is JSON Lines despite its name; renaming it would orphan old logs.)
 REWARDS = os.path.join(STATE, "rewards.json")
 REWARD_CURRENT = os.path.join(STATE, "reward.current")
 REWARD_SESSION_WARN_MIN = 60
 REWARD_WEEKLY_WARN_MIN = 120
 REWARD_TIMER_UNIT = "studydash-reward-timer"
+
+
+# ------------------------------------------------------------------- config
+
+# (section, key) -> (global name, type check, convert). One table, so the
+# config reference in the README, validation and application cannot drift.
+def _positive(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and x > 0
+
+
+def _intervals(x):
+    return (isinstance(x, list) and x
+            and all(isinstance(i, int) and not isinstance(i, bool) and i > 0 for i in x))
+
+
+def _paths(x):
+    return isinstance(x, list) and all(isinstance(i, str) for i in x)
+
+
+CONFIG_KEYS = {
+    ("course", "name"): ("COURSE_NAME", lambda x: isinstance(x, str), str),
+    ("course", "target_date"): ("TARGET_DATE", lambda x: parse_date(x) is not None,
+                                   lambda x: parse_date(x)),
+    ("course", "weekly_hours"): ("TARGET_WEEKLY_HOURS", _positive, float),
+    ("sessions", "cap_hours"): ("SESSION_CAP_HOURS", _positive, float),
+    ("sessions", "min_seconds"): ("SESSION_MIN_SECONDS",
+                                  lambda x: isinstance(x, int) and not isinstance(x, bool) and x >= 0,
+                                  int),
+    ("sessions", "nudge_minutes"): ("STUDY_NUDGE_MIN", _positive, int),
+    ("review", "intervals"): ("REVIEW_INTERVALS", _intervals, list),
+    ("review", "cold_days"): ("COLD_TOPIC_DAYS", _positive, int),
+    ("rewards", "session_warn_minutes"): ("REWARD_SESSION_WARN_MIN", _positive, int),
+    ("rewards", "weekly_warn_minutes"): ("REWARD_WEEKLY_WARN_MIN", _positive, int),
+    ("load", "scan_roots"): ("SCAN_ROOTS", _paths,
+                             lambda xs: [os.path.expanduser(x) for x in xs]),
+    ("load", "depth"): ("WORK_SCAN_DEPTH", _positive, int),
+}
+
+
+def load_config(path=None):
+    """Read config.toml into {(section, key): value}, validated.
+
+    A bad value is reported and skipped - it falls back to the default -
+    never fatal: a typo in the config must not take the dashboard down.
+    Returns {} if the file does not exist.
+    """
+    path = path or CONFIG
+    if not os.path.exists(path):
+        return {}
+    try:
+        import tomllib
+    except ImportError:
+        warn("Python 3.11+ is needed to read %s; using defaults" % path)
+        return {}
+    try:
+        with open(path, "rb") as fh:
+            raw = tomllib.load(fh)
+    except (OSError, ValueError) as exc:
+        warn("%s could not be read (%s); using defaults" % (path, exc))
+        return {}
+
+    out = {}
+    for section, table in raw.items():
+        if not isinstance(table, dict):
+            warn("config: [%s] is not a table, ignored" % section)
+            continue
+        for key, value in table.items():
+            spec = CONFIG_KEYS.get((section, key))
+            if spec is None:
+                warn("config: unknown key %s.%s, ignored" % (section, key))
+                continue
+            if not spec[1](value):
+                warn("config: %s.%s = %r is not valid, using the default" % (section, key, value))
+                continue
+            out[(section, key)] = spec[2](value)
+    return out
+
+
+def apply_config(values):
+    g = globals()
+    for spec_key, value in values.items():
+        g[CONFIG_KEYS[spec_key][0]] = value
+
+
+def is_configured():
+    return TARGET_DATE is not None
 
 
 # --------------------------------------------------------------------- io
@@ -526,6 +618,10 @@ def repos_touched(repos, since):
 
 
 def build_load():
+    # The load card is opt-in: with no scan roots there is nothing to count,
+    # and a zero would read as "you are not overloaded", which is unknown.
+    if not SCAN_ROOTS:
+        return None
     repos = find_repos()
     return {
         "repos_touched_7d": repos_touched(repos, "7 days ago"),
@@ -544,8 +640,12 @@ def collect():
         # The overlay compares this to the clock. It is the one judgement it
         # cannot get from here: whether here has stopped running.
         "stale_after": (generated + timedelta(minutes=STALE_STATS_MINUTES)).isoformat(),
-        "course": build_course(read_jsonl(PROGRESS), ref),
+        # False until a target date is set. The overlay shows "not set up"
+        # instead of a course card full of zeros that would look like a result.
+        "configured": is_configured(),
+        "course": build_course(read_jsonl(PROGRESS), ref) if is_configured() else None,
         "hours": hours,
+        "sessions": {"nudge_minutes": STUDY_NUDGE_MIN},
         "revision": build_revision(read_jsonl(ROOMS), ref),
         "load": build_load(),
     }
@@ -599,8 +699,9 @@ def session_start():
     # A forgotten timer is how one session became 43 hours. Ask before the
     # cap starts throwing time away.
     schedule_nudge(STUDY_TIMER_UNIT, STUDY_NUDGE_MIN, "Study session",
-                   "running for %dh - still studying? SUPER+R stops it."
-                   % (STUDY_NUDGE_MIN // 60))
+                   "running for %s - still studying? Click the badge or run "
+                   "`studydash session stop`."
+                   % human_span(timedelta(minutes=STUDY_NUDGE_MIN)))
     return 0
 
 
@@ -746,8 +847,11 @@ def reward_start(rest):
     # on rewards, not to be told after adding to it.
     week = reward_week_minutes(read_jsonl(REWARDS), today())
     if week > REWARD_WEEKLY_WARN_MIN:
-        print("note: %d min of rewards already this week (over %d)"
-              % (round(week), REWARD_WEEKLY_WARN_MIN))
+        msg = ("%d min of rewards already this week (over %d)"
+               % (round(week), REWARD_WEEKLY_WARN_MIN))
+        print("note: " + msg)
+        # Usually started from a keybind, where stdout is never seen.
+        notify("Reward breaks this week", msg)
 
     os.makedirs(STATE, exist_ok=True)
     started = now().replace(microsecond=0)
@@ -832,7 +936,7 @@ def cmd_reward(args):
 
 def cmd_log(args):
     if not args:
-        warn("usage: studydash log <percent> [--room NAME]...")
+        warn("usage: studydash log <percent> [--topic NAME]...")
         return 2
     try:
         percent = float(args[0])
@@ -847,9 +951,10 @@ def cmd_log(args):
     rest = args[1:]
     i = 0
     while i < len(rest):
-        if rest[i] == "--room":
+        # --room is the original name, kept so old habits and scripts work.
+        if rest[i] in ("--topic", "--room"):
             if i + 1 >= len(rest):
-                warn("--room needs a name")
+                warn("%s needs a name" % rest[i])
                 return 2
             rooms.append(rest[i + 1])
             i += 2
@@ -864,7 +969,7 @@ def cmd_log(args):
 
     print("logged %g%% on %s" % (percent, stamp))
     for room in rooms:
-        print("  room completed: %s" % room)
+        print("  topic completed: %s" % room)
     collect()
     return 0
 
@@ -923,13 +1028,10 @@ def fmt(value, suffix=""):
     return "-" if value is None else "%s%s" % (value, suffix)
 
 
-def cmd_status(_args):
-    stats, truncated = collect()
-    c, h, r, l = stats["course"], stats["hours"], stats["revision"], stats["load"]
-
+def print_course(c):
     left = c["days_remaining"]
-    print("course  %s%%  ·  %s  ·  %s"
-          % (c["percent"],
+    print("course  %s  %s%%  ·  %s  ·  %s"
+          % (c["name"] or "(unnamed)", c["percent"],
              ("%d days left" % left) if left >= 0 else ("%d days past target" % -left),
              c["status"]))
     print("        %s needed vs %s actual"
@@ -939,6 +1041,38 @@ def cmd_status(_args):
         print("        no progress logged yet")
     else:
         print("        last progress %d days ago" % c["days_since_last_progress"])
+
+
+def print_load(l):
+    print("load    %d repos touched in 7d  ·  %d in 28d"
+          % (l["repos_touched_7d"], l["repos_touched_28d"]))
+
+    # Show the scan itself, so the number above can be checked against reality
+    # rather than trusted. Missing roots come first: they are the actionable
+    # thing, and a root that is silently wrong reads exactly like a root that
+    # is merely empty.
+    groups, missing = scan_roots()
+    for root in missing:
+        print("        ! scan root does not exist: %s" % tilde(root))
+    for root, repos in groups:
+        if not repos:
+            print("        %s — no repos" % tilde(root))
+            continue
+        print("        %s   %d repos" % (tilde(root), len(repos)))
+        recent = set(touched_repos(repos, "7 days ago"))
+        for repo in repos:
+            mark = " · touched 7d" if repo in recent else ""
+            print(("            %-34s%s" % (os.path.relpath(repo, root), mark)).rstrip())
+
+
+def cmd_status(_args):
+    stats, truncated = collect()
+    c, h, r, l = stats["course"], stats["hours"], stats["revision"], stats["load"]
+
+    if c is None:
+        print("course  not set up - run: studydash setup")
+    else:
+        print_course(c)
 
     print("")
     print("hours   %.1fh/wk avg vs %.1fh target — %s"
@@ -965,26 +1099,9 @@ def cmd_status(_args):
     if r["cold_topics"]:
         print("        cold %dd+: %s" % (COLD_TOPIC_DAYS, ", ".join(r["cold_topics"])))
 
-    print("")
-    print("load    %d repos touched in 7d  ·  %d in 28d"
-          % (l["repos_touched_7d"], l["repos_touched_28d"]))
-
-    # Show the scan itself, so the number above can be checked against reality
-    # rather than trusted. Missing roots come first: they are the actionable
-    # thing, and a root that is silently wrong reads exactly like a root that
-    # is merely empty.
-    groups, missing = scan_roots()
-    for root in missing:
-        print("        ! scan root does not exist: %s" % tilde(root))
-    for root, repos in groups:
-        if not repos:
-            print("        %s — no repos" % tilde(root))
-            continue
-        print("        %s   %d repos" % (tilde(root), len(repos)))
-        recent = set(touched_repos(repos, "7 days ago"))
-        for repo in repos:
-            mark = " · touched 7d" if repo in recent else ""
-            print(("            %-34s%s" % (os.path.relpath(repo, root), mark)).rstrip())
+    if l is not None:
+        print("")
+        print_load(l)
 
     running = read_current()
     if running is not None:
@@ -996,15 +1113,315 @@ def cmd_status(_args):
 
 # --------------------------------------------------------------------- main
 
+# -------------------------------------------------------------- setup
+
+PLUGIN_ID = "ra.studydash"
+LINK = os.path.expanduser("~/.local/bin/studydash")
+UNIT_DIR = os.path.expanduser("~/.config/systemd/user")
+UNITS = ["studydash.service", "studydash.timer"]
+
+KEYBINDS = '''\
+-- studydash (https://github.com/Abdullraaa/studydash)
+o.bind("SUPER + D", "Study dashboard", "omarchy-shell shell toggle %s")
+o.bind("SUPER + R", "Study session", "~/.local/bin/studydash session toggle")
+o.bind("SUPER + ALT + R", "Reward break", "~/.local/bin/studydash reward toggle")
+''' % PLUGIN_ID
+
+
+def self_path():
+    # Real path, so running setup through the ~/.local/bin link still finds
+    # the plugin folder (and its systemd/ directory) the link points into.
+    return os.path.realpath(os.path.abspath(__file__))
+
+
+def plugin_root():
+    return os.path.dirname(os.path.dirname(self_path()))
+
+
+def config_text(name, target, weekly):
+    return '''\
+# studydash configuration. Every key except [course] is optional; the values
+# shown commented out are the defaults. Re-run `studydash collect` (or wait
+# for the 15-minute timer) after editing.
+
+[course]
+name = %s
+target_date = %s          # YYYY-MM-DD: the day you want to be at 100%%
+weekly_hours = %s           # study hours per week you are aiming for
+
+[sessions]
+# cap_hours = 4             # a longer session counts as this (forgotten timer)
+# min_seconds = 60          # a shorter one is a mis-press and is not counted
+# nudge_minutes = 180       # "still studying?" reminder while a session runs
+
+[review]
+# intervals = [7, 30, 90]   # days to each review, from the previous one
+# cold_days = 90            # untouched this long = listed as gone cold
+
+[rewards]
+# session_warn_minutes = 60
+# weekly_warn_minutes = 120
+
+[load]
+# Optional card: how many git repos you touched this week - a measure of
+# other work competing with study. Off while this list is empty.
+# scan_roots = ["~/Projects"]
+# depth = 2
+''' % (json.dumps(name), target.isoformat(), ("%g" % weekly))
+
+
+def ask(prompt, default=None, check=None):
+    while True:
+        suffix = " [%s]" % default if default not in (None, "") else ""
+        try:
+            raw = input("%s%s: " % (prompt, suffix)).strip()
+        except EOFError:
+            raw = ""
+        value = raw or default
+        if value in (None, ""):
+            print("  required")
+            continue
+        if check is None:
+            return value
+        ok, result = check(value)
+        if ok:
+            return result
+        print("  " + result)
+
+
+def check_date(value):
+    d = parse_date(value)
+    if d is None:
+        return False, "use YYYY-MM-DD"
+    if d <= today():
+        return False, "that date is not in the future"
+    return True, d
+
+
+def check_hours(value):
+    try:
+        h = float(value)
+    except ValueError:
+        return False, "a number of hours, e.g. 5"
+    return (True, h) if h > 0 else (False, "must be more than 0")
+
+
+def run_quiet(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except OSError as exc:
+        return subprocess.CompletedProcess(cmd, 127, "", str(exc))
+
+
+def setup_config(opts):
+    if os.path.exists(CONFIG) and not opts["reconfigure"]:
+        print("config    kept %s (--reconfigure to answer the questions again)"
+              % tilde(CONFIG))
+        return 0
+    interactive = sys.stdin.isatty() and not opts["yes"]
+    name, target, weekly = opts["course"], opts["target"], opts["weekly"]
+
+    if target is not None:
+        ok, target = check_date(target)
+        if not ok:
+            warn("--target: " + target)
+            return 2
+    if weekly is not None:
+        ok, weekly = check_hours(weekly)
+        if not ok:
+            warn("--weekly-hours: " + weekly)
+            return 2
+
+    if interactive:
+        print("A few questions to set up your course. Enter keeps the [default].")
+        name = name or ask("Course name")
+        target = target or ask("Target finish date (YYYY-MM-DD)", check=check_date)
+        weekly = weekly or ask("Study hours per week", "5", check_hours)
+    elif not (name and target):
+        warn("non-interactive setup needs --course and --target")
+        return 2
+    weekly = weekly or 5.0
+
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    if os.path.exists(CONFIG):
+        backup = "%s.bak.%d" % (CONFIG, int(now().timestamp()))
+        shutil.copy2(CONFIG, backup)
+        print("config    previous one saved as %s" % tilde(backup))
+    with open(CONFIG, "w", encoding="utf-8") as fh:
+        fh.write(config_text(name, target, weekly))
+    print("config    wrote %s" % tilde(CONFIG))
+    return 0
+
+
+def setup_link(opts):
+    target = self_path()
+    if os.path.islink(LINK):
+        if os.path.realpath(LINK) == target:
+            print("command   %s already links here" % tilde(LINK))
+            return 0
+        if not opts["force"]:
+            warn("%s links to %s, not this copy; --force replaces it"
+                 % (tilde(LINK), os.path.realpath(LINK)))
+            return 1
+        os.unlink(LINK)
+    elif os.path.exists(LINK):
+        if os.path.realpath(LINK) == target:
+            return 0
+        if not opts["force"]:
+            warn("%s is an existing file, not a link; --force backs it up and replaces it"
+                 % tilde(LINK))
+            return 1
+        backup = "%s.bak.%d" % (LINK, int(now().timestamp()))
+        os.rename(LINK, backup)
+        print("command   old %s saved as %s" % (tilde(LINK), tilde(backup)))
+    os.makedirs(os.path.dirname(LINK), exist_ok=True)
+    os.symlink(target, LINK)
+    print("command   %s -> %s" % (tilde(LINK), tilde(target)))
+    on_path = any(os.path.realpath(p) == os.path.realpath(os.path.dirname(LINK))
+                  for p in os.environ.get("PATH", "").split(os.pathsep) if p)
+    if not on_path:
+        print("          ! ~/.local/bin is not on your PATH; use the full path, or add it")
+    return 0
+
+
+def setup_systemd(opts):
+    if opts["no_systemd"]:
+        print("timer     skipped (--no-systemd)")
+        return 0
+    if not shutil.which("systemctl"):
+        print("timer     ! systemctl not found; run `studydash collect` yourself")
+        return 0
+    src = os.path.join(plugin_root(), "systemd")
+    os.makedirs(UNIT_DIR, exist_ok=True)
+    for unit in UNITS:
+        shutil.copyfile(os.path.join(src, unit), os.path.join(UNIT_DIR, unit))
+    run_quiet(["systemctl", "--user", "daemon-reload"])
+    result = run_quiet(["systemctl", "--user", "enable", "--now", "studydash.timer"])
+    if result.returncode != 0:
+        print("timer     ! could not enable studydash.timer: %s" % result.stderr.strip())
+        return 1
+    print("timer     studydash.timer enabled - stats rebuild every 15 minutes")
+    return 0
+
+
+def plugin_state():
+    if not shutil.which("omarchy"):
+        return None
+    result = run_quiet(["omarchy", "plugin", "list", "--json"])
+    if result.returncode != 0:
+        return None
+    try:
+        for p in json.loads(result.stdout):
+            if p.get("id") == PLUGIN_ID:
+                return p.get("state") or ("enabled" if p.get("enabled") else "disabled")
+    except (ValueError, AttributeError):
+        return None
+    return "missing"
+
+
+def parse_setup_opts(args):
+    opts = {"course": None, "target": None, "weekly": None,
+            "yes": False, "force": False, "reconfigure": False, "no_systemd": False}
+    flags = {"--course": "course", "--target": "target", "--weekly-hours": "weekly"}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in flags:
+            if i + 1 >= len(args):
+                warn("%s needs a value" % a)
+                return None
+            opts[flags[a]] = args[i + 1]
+            i += 2
+        elif a in ("--yes", "-y"):
+            opts["yes"] = True
+            i += 1
+        elif a == "--force":
+            opts["force"] = True
+            i += 1
+        elif a == "--reconfigure":
+            opts["reconfigure"] = True
+            i += 1
+        elif a == "--no-systemd":
+            opts["no_systemd"] = True
+            i += 1
+        else:
+            warn("unexpected argument: %s" % a)
+            return None
+    return opts
+
+
+def cmd_setup(args):
+    """Idempotent: every step checks before it acts, so re-running is safe."""
+    opts = parse_setup_opts(args)
+    if opts is None:
+        return 2
+    for step in (setup_config, setup_link, setup_systemd):
+        rc = step(opts)
+        if rc:
+            return rc
+    apply_config(load_config())
+    collect()
+    print("stats     wrote %s" % tilde(STATS))
+
+    state = plugin_state()
+    if state is None:
+        print("plugin    ? could not ask omarchy about %s" % PLUGIN_ID)
+    elif state == "missing":
+        print("plugin    ! %s is not installed: omarchy plugin add "
+              "https://github.com/Abdullraaa/studydash --enable" % PLUGIN_ID)
+    elif state != "enabled":
+        print("plugin    ! %s is %s: omarchy plugin enable %s" % (PLUGIN_ID, state, PLUGIN_ID))
+    else:
+        print("plugin    %s enabled" % PLUGIN_ID)
+
+    print("")
+    print("Last step - add keybinds. Paste into ~/.config/hypr/bindings.lua,")
+    print("after checking the keys are free (`hyprctl binds`):")
+    print("")
+    print(KEYBINDS)
+    print("Then: SUPER+R starts a study session, SUPER+D shows the dashboard.")
+    print("Log progress as you go: studydash log <percent> [--topic NAME]")
+    return 0
+
+
+def cmd_uninstall(_args):
+    """Undo setup. Never touches the data or the config - say where they are."""
+    if shutil.which("systemctl"):
+        run_quiet(["systemctl", "--user", "disable", "--now", "studydash.timer"])
+        cancel_nudge(STUDY_TIMER_UNIT)
+        cancel_nudge(REWARD_TIMER_UNIT)
+    for unit in UNITS:
+        path = os.path.join(UNIT_DIR, unit)
+        if os.path.exists(path):
+            os.unlink(path)
+            print("removed   %s" % tilde(path))
+    if shutil.which("systemctl"):
+        run_quiet(["systemctl", "--user", "daemon-reload"])
+    if os.path.islink(LINK) and os.path.realpath(LINK) == self_path():
+        os.unlink(LINK)
+        print("removed   %s" % tilde(LINK))
+    print("")
+    print("kept      %s (your logs)" % tilde(STATE))
+    print("kept      %s" % tilde(CONFIG))
+    print("Delete those by hand if you want them gone. To remove the overlay:")
+    print("  omarchy plugin remove %s" % PLUGIN_ID)
+    return 0
+
+
 USAGE = """usage: studydash <command>
 
-  log <percent> [--room NAME]...  record course progress, and rooms finished
-  review <room>                   clear one review - after redoing the work
+  setup [--course NAME --target YYYY-MM-DD --weekly-hours N] [--yes]
+        [--reconfigure] [--force] [--no-systemd]
+                                  first-time setup; safe to re-run
+  log <percent> [--topic NAME]... record course progress, and topics finished
+                                  (a topic is a room, module, chapter...)
+  review <topic>                  clear one review - after redoing the work
                                   (any unique, case-insensitive prefix)
   session start|stop|toggle|status
   reward start|stop|toggle|status  [--topic NAME]   log a reward break
   collect                         rebuild stats.json
   status                          print everything the dashboard shows
+  uninstall                       undo setup; keeps your data and config
 """
 
 
@@ -1013,6 +1430,11 @@ def main(argv):
         print(USAGE, end="")
         return 0
     cmd, args = argv[0], argv[1:]
+    if cmd == "setup":
+        return cmd_setup(args)
+    if cmd == "uninstall":
+        return cmd_uninstall(args)
+    apply_config(load_config())
     if cmd == "log":
         return cmd_log(args)
     if cmd == "review":

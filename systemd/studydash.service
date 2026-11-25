@@ -1,6 +1,6 @@
 [Unit]
 Description=Rebuild the study dashboard stats file
-Documentation=file:///home/ra/.local/bin/studydash
+Documentation=https://github.com/Abdullraaa/studydash
 
 [Service]
 Type=oneshot

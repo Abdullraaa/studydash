@@ -48,7 +48,7 @@ PACE_WINDOW_DAYS = 28
 # Past this, no amount of arithmetic earns anything but "behind".
 STALE_PROGRESS_DAYS = 10
 
-REVIEW_INTERVALS = [7, 30, 90]
+REVIEW_INTERVALS = [7, 30, 90]  # each measured from the previous touch
 COLD_TOPIC_DAYS = 90
 
 # Where project work lives. Add a root here and the load card picks it up;
@@ -429,10 +429,16 @@ def build_revision(rooms, ref):
 
         # Report only the earliest outstanding interval per room. A room
         # neglected for a year should be one line saying so, not three.
+        #
+        # Each interval runs from the previous touch - the completion for the
+        # first, the last review for the rest - not from the completion. So a
+        # 7d review done late pushes the 30d one out with it, instead of
+        # leaving it already overdue the moment the late review is logged.
         for i, interval in enumerate(REVIEW_INTERVALS):
             if len(reviews) > i:
                 continue
-            due_at = completed + timedelta(days=interval)
+            anchor = completed if i == 0 else reviews[i - 1]
+            due_at = anchor + timedelta(days=interval)
             if ref >= due_at:
                 due.append({
                     "room": name,
